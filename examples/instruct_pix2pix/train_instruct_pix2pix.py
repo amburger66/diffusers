@@ -135,6 +135,13 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--pretrained_unet_model_name_or_path",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to pretrained unet model or model identifier from huggingface.co/models.",
+    )
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -579,8 +586,13 @@ def main():
         revision=args.revision,
         variant=args.variant,
     )
+    unet_model = (
+        args.pretrained_unet_model_name_or_path
+        if args.pretrained_unet_model_name_or_path is not None
+        else args.pretrained_model_name_or_path
+    )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
+        unet_model,
         subfolder="unet",
         revision=args.non_ema_revision,
     )
@@ -1196,6 +1208,7 @@ def main():
                     revision=args.revision,
                     variant=args.variant,
                     torch_dtype=weight_dtype,
+                    safety_checker=None,
                 )
 
                 log_validation(
@@ -1225,6 +1238,7 @@ def main():
             unet=unwrap_model(unet),
             revision=args.revision,
             variant=args.variant,
+            safety_checker=None,
         )
         pipeline.save_pretrained(args.output_dir)
 
