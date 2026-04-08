@@ -36,8 +36,12 @@ import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
+from accelerate.utils import (
+    DistributedDataParallelKwargs,
+    ProjectConfiguration,
+    set_seed,
+)
+from datasets import load_dataset, load_from_disk
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
@@ -52,11 +56,19 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import EMAModel
-from diffusers.utils import check_min_version, deprecate, is_wandb_available
+from diffusers.training_utils import EMAModel, cast_training_params
+from diffusers.utils import (
+    check_min_version,
+    convert_state_dict_to_diffusers,
+    convert_unet_state_dict_to_peft,
+    deprecate,
+    is_wandb_available,
+)
 from diffusers.utils.constants import DIFFUSERS_REQUEST_TIMEOUT
-from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.import_utils import is_peft_available, is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 
 
 if is_wandb_available():
@@ -179,6 +191,12 @@ def parse_args():
             " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
             " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
         ),
+    )
+    parser.add_argument(
+        "--preprocessed_train_data_dir",
+        type=str,
+        default=None,
+        help="Path to a dataset saved with datasets.save_to_disk(...)",
     )
     parser.add_argument(
         "--original_image_column",
@@ -468,6 +486,32 @@ def parse_args():
         action="store_true",
         help="Whether or not to use xformers.",
     )
+    parser.add_argument(
+        "--train_lora",
+        action="store_true",
+        help=(
+            "Train PEFT LoRA adapters on UNet attention projections only (to_q, to_k, to_v, to_out.0). "
+            "The expanded conv_in remains frozen as part of the base model."
+        ),
+    )
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=4,
+        help="LoRA rank (dimension of the update matrices). Only used with --train_lora.",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=None,
+        help="LoRA alpha scaling. Defaults to `--rank` when --train_lora is set.",
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.0,
+        help="LoRA dropout. Only used with --train_lora.",
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -475,12 +519,28 @@ def parse_args():
         args.local_rank = env_local_rank
 
     # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
+    if (
+        args.dataset_name is None
+        and args.train_data_dir is None
+        and args.preprocessed_train_data_dir is None
+    ):
+        raise ValueError(
+            "Need either a dataset name, a training folder, or a preprocessed training data directory."
+        )
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
         args.non_ema_revision = args.revision
+
+    if args.train_lora:
+        if args.use_ema:
+            raise ValueError("`--use_ema` cannot be used with `--train_lora`.")
+        if not is_peft_available():
+            raise ImportError(
+                "PEFT is required for LoRA training. Install it with `pip install peft`."
+            )
+        if args.lora_alpha is None:
+            args.lora_alpha = args.rank
 
     return args
 
@@ -520,11 +580,13 @@ def main():
     accelerator_project_config = ProjectConfiguration(
         project_dir=args.output_dir, logging_dir=logging_dir
     )
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        kwargs_handlers=[ddp_kwargs],
     )
 
     # Disable AMP for MPS.
@@ -623,6 +685,26 @@ def main():
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    if args.train_lora:
+        unet.requires_grad_(False)
+        unet.to(accelerator.device, dtype=weight_dtype)
+        unet_lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            init_lora_weights="gaussian",
+            target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        )
+        unet.add_adapter(unet_lora_config)
+        if accelerator.mixed_precision == "fp16":
+            cast_training_params(unet, dtype=torch.float32)
+
     # Create EMA for the unet.
     if args.use_ema:
         ema_unet = EMAModel(
@@ -651,40 +733,95 @@ def main():
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(models, weights, output_dir):
-            if accelerator.is_main_process:
+        if args.train_lora:
+
+            def save_model_hook(models, weights, output_dir):
+                if accelerator.is_main_process:
+                    unet_lora_layers_to_save = None
+                    for model in models:
+                        if isinstance(model, type(unwrap_model(unet))):
+                            unet_lora_layers_to_save = get_peft_model_state_dict(model)
+                        else:
+                            raise ValueError(
+                                f"Unexpected save model: {model.__class__}"
+                            )
+                        if weights:
+                            weights.pop()
+
+                    StableDiffusionInstructPix2PixPipeline.save_lora_weights(
+                        save_directory=output_dir,
+                        unet_lora_layers=unet_lora_layers_to_save,
+                        safe_serialization=True,
+                    )
+
+            def load_model_hook(models, input_dir):
+                unet_ = None
+                while len(models) > 0:
+                    model = models.pop()
+                    if isinstance(model, type(unwrap_model(unet))):
+                        unet_ = model
+                    else:
+                        raise ValueError(f"Unexpected save model: {model.__class__}")
+
+                lora_state_dict, _ = (
+                    StableDiffusionInstructPix2PixPipeline.lora_state_dict(input_dir)
+                )
+                unet_state_dict = {
+                    f"{k.replace('unet.', '')}": v
+                    for k, v in lora_state_dict.items()
+                    if k.startswith("unet.")
+                }
+                unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
+                incompatible_keys = set_peft_model_state_dict(
+                    unet_, unet_state_dict, adapter_name="default"
+                )
+                if incompatible_keys is not None:
+                    unexpected_keys = getattr(
+                        incompatible_keys, "unexpected_keys", None
+                    )
+                    if unexpected_keys:
+                        logger.warning(
+                            "Loading adapter weights from state_dict led to unexpected keys not found in the model: "
+                            f"{unexpected_keys}."
+                        )
+                if accelerator.mixed_precision == "fp16":
+                    cast_training_params([unet_], dtype=torch.float32)
+
+        else:
+
+            def save_model_hook(models, weights, output_dir):
+                if accelerator.is_main_process:
+                    if args.use_ema:
+                        ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+
+                    for i, model in enumerate(models):
+                        model.save_pretrained(os.path.join(output_dir, "unet"))
+
+                        # make sure to pop weight so that corresponding model is not saved again
+                        if weights:
+                            weights.pop()
+
+            def load_model_hook(models, input_dir):
                 if args.use_ema:
-                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+                    load_model = EMAModel.from_pretrained(
+                        os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
+                    )
+                    ema_unet.load_state_dict(load_model.state_dict())
+                    ema_unet.to(accelerator.device)
+                    del load_model
 
-                for i, model in enumerate(models):
-                    model.save_pretrained(os.path.join(output_dir, "unet"))
+                for i in range(len(models)):
+                    # pop models so that they are not loaded again
+                    model = models.pop()
 
-                    # make sure to pop weight so that corresponding model is not saved again
-                    if weights:
-                        weights.pop()
+                    # load diffusers style into model
+                    load_model = UNet2DConditionModel.from_pretrained(
+                        input_dir, subfolder="unet"
+                    )
+                    model.register_to_config(**load_model.config)
 
-        def load_model_hook(models, input_dir):
-            if args.use_ema:
-                load_model = EMAModel.from_pretrained(
-                    os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
-                )
-                ema_unet.load_state_dict(load_model.state_dict())
-                ema_unet.to(accelerator.device)
-                del load_model
-
-            for i in range(len(models)):
-                # pop models so that they are not loaded again
-                model = models.pop()
-
-                # load diffusers style into model
-                load_model = UNet2DConditionModel.from_pretrained(
-                    input_dir, subfolder="unet"
-                )
-                model.register_to_config(**load_model.config)
-
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -718,8 +855,13 @@ def main():
     else:
         optimizer_cls = torch.optim.AdamW
 
+    params_to_optimize = (
+        filter(lambda p: p.requires_grad, unet.parameters())
+        if args.train_lora
+        else unet.parameters()
+    )
     optimizer = optimizer_cls(
-        unet.parameters(),
+        params_to_optimize,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -731,28 +873,35 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/main/en/image_load#imagefolder
+    if args.dataset_name is not None or args.train_data_dir is not None:
+        with accelerator.main_process_first():
+            if args.dataset_name is not None:
+                dataset = load_dataset(
+                    args.dataset_name,
+                    args.dataset_config_name,
+                    cache_dir=args.cache_dir,
+                )
+                train_split = dataset["train"]
+            elif args.train_data_dir is not None:
+                data_files = {}
+                if args.train_data_dir is not None:
+                    data_files["train"] = os.path.join(args.train_data_dir, "**")
+                dataset = load_dataset(
+                    "imagefolder",
+                    data_files=data_files,
+                    cache_dir=args.cache_dir,
+                )
+                train_split = dataset["train"]
 
-    # Preprocessing the datasets.
-    # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+    if args.preprocessed_train_data_dir is not None:
+        train_split = load_from_disk(args.preprocessed_train_data_dir)
+
+    column_names = train_split.column_names
+
+    if args.max_train_samples is not None:
+        train_split = train_split.shuffle(seed=args.seed).select(
+            range(args.max_train_samples)
+        )
 
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
@@ -856,16 +1005,6 @@ def main():
         examples["input_ids"] = tokenize_captions(captions)
         return examples
 
-    with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = (
-                dataset["train"]
-                .shuffle(seed=args.seed)
-                .select(range(args.max_train_samples))
-            )
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
-
     def collate_fn(examples):
         original_pixel_values = torch.stack(
             [example["original_pixel_values"] for example in examples]
@@ -887,12 +1026,15 @@ def main():
         }
 
     # DataLoaders creation:
+    train_dataset = train_split.with_transform(preprocess_train)
+
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        drop_last=True,
     )
 
     # Scheduler and math around the number of training steps.
@@ -929,14 +1071,6 @@ def main():
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
-
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -981,6 +1115,8 @@ def main():
     )
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    num_trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    logger.info(f"  Num trainable parameters = {num_trainable_params:,}")
     global_step = 0
     first_epoch = 0
 
@@ -1128,7 +1264,8 @@ def main():
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    params_to_clip = params_to_optimize
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1231,16 +1368,38 @@ def main():
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
 
-        pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            text_encoder=unwrap_model(text_encoder),
-            vae=unwrap_model(vae),
-            unet=unwrap_model(unet),
-            revision=args.revision,
-            variant=args.variant,
-            safety_checker=None,
-        )
-        pipeline.save_pretrained(args.output_dir)
+        if args.train_lora:
+            unet_unwrapped = unwrap_model(unet)
+            unet_unwrapped = unet_unwrapped.to(torch.float32)
+            unet_lora_state_dict = convert_state_dict_to_diffusers(
+                get_peft_model_state_dict(unet_unwrapped)
+            )
+            StableDiffusionInstructPix2PixPipeline.save_lora_weights(
+                save_directory=args.output_dir,
+                unet_lora_layers=unet_lora_state_dict,
+                safe_serialization=True,
+            )
+            # UNet already has LoRA adapters (and 8-channel conv_in); use it for validation without reloading.
+            pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                text_encoder=unwrap_model(text_encoder),
+                vae=unwrap_model(vae),
+                unet=unet_unwrapped,
+                revision=args.revision,
+                variant=args.variant,
+                safety_checker=None,
+            )
+        else:
+            pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                text_encoder=unwrap_model(text_encoder),
+                vae=unwrap_model(vae),
+                unet=unwrap_model(unet),
+                revision=args.revision,
+                variant=args.variant,
+                safety_checker=None,
+            )
+            pipeline.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
             upload_folder(
