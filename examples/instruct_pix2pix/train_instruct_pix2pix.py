@@ -551,9 +551,13 @@ def convert_to_np(image, resolution):
 
 
 def download_image(url):
-    image = PIL.Image.open(
-        requests.get(url, stream=True, timeout=DIFFUSERS_REQUEST_TIMEOUT).raw
-    )
+    if url.startswith("file://") or "://" not in url:
+        path = url[len("file://"):] if url.startswith("file://") else url
+        image = PIL.Image.open(path)
+    else:
+        image = PIL.Image.open(
+            requests.get(url, stream=True, timeout=DIFFUSERS_REQUEST_TIMEOUT).raw
+        )
     image = PIL.ImageOps.exif_transpose(image)
     image = image.convert("RGB")
     return image
